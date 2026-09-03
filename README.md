@@ -43,8 +43,20 @@ sequenceDiagram
 cmd/auth-token/        handler de emissão do token
 cmd/auth-authorizer/   handler do authorizer do API Gateway
 internal/cpf/          validação de dígitos verificadores (sem dependência externa)
+internal/token/        contrato de claims compartilhado com a aplicação
+internal/segredo/      Secrets Manager com cache por container
 terraform/             funções, IAM, integração e rotas
+Makefile               empacota as funções em dist/*.zip
 ```
+
+## Empacotamento
+
+```bash
+make build   # dist/auth-token.zip e dist/auth-authorizer.zip
+make test    # go test ./... -race -cover
+```
+
+O runtime `provided.al2023` tem duas exigências que **falham em silêncio** quando erradas: o binário dentro do zip precisa se chamar `bootstrap`, e a arquitetura precisa casar com a declarada na função — aqui, `arm64`.
 
 ## Execução local
 
