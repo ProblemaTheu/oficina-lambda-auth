@@ -27,6 +27,12 @@ locals {
       route_key = "GET /health/{proxy+}"
       caminho   = "/health/{proxy}"
     }
+    # {proxy+} exige ao menos um segmento depois da barra, então /health puro
+    # não casa com a rota acima e responderia 404.
+    health_raiz = {
+      route_key = "GET /health"
+      caminho   = "/health"
+    }
   }
 }
 
