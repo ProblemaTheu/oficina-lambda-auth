@@ -1,0 +1,278 @@
+# CI/CD das Lambdas de autenticação.
+#
+#   Pull Request  → testes + gitleaks + `terraform plan` comentado (role read-only)
+#   push em main  → testes + build dos zips + `terraform apply` + smoke test
+#
+# O deploy do código é feito pelo Terraform, não por `aws lambda
+# update-function-code`: `aws_lambda_function` tem `source_code_hash`, então
+# se o zip não mudou nada é reenviado, e se mudou o state reflete. Misturar
+# as duas abordagens gera drift permanente no plan.
+#
+# Duas roles OIDC (ver oficina-infra-k8s/bootstrap): AWS_PLAN_ROLE_ARN só lê e
+# é a única que um PR consegue assumir; AWS_ROLE_ARN aplica e só aceita `main`
+# ou `environment: prod`.
+
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [homolog, main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Testes — roda em PR e em push
+  # ─────────────────────────────────────────────
+  testes:
+    name: Build e testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          nao_formatados=$(gofmt -l .)
+          if [ -n "$nao_formatados" ]; then
+            echo "Arquivos fora do gofmt:"; echo "$nao_formatados"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Testes (race + cobertura)
+        run: go test ./... -race -count=1 -covermode=atomic -coverprofile=coverage.out
+
+      - name: Job Summary
+        if: always()
+        run: |
+          {
+            echo "# 🧪 Testes"
+            echo
+            echo '```'
+            go tool cover -func=coverage.out 2>/dev/null | tail -n 1 || echo "(sem cobertura)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  segredos:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # Pull Request: compila (o plan depende do hash dos zips) e planeja
+  # ─────────────────────────────────────────────
+  plan:
+    name: Plan (pull request)
+    if: github.event_name == 'pull_request'
+    needs: testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # `source_code_hash` lê os zips: sem eles o plan nem começa. O build é
+      # reproduzível (-trimpath), então código igual gera hash igual.
+      - name: Compilar e empacotar as funções
+        run: make build
+
+      - name: Versão do Terraform
+        id: tfv
+        run: echo "versao=$(cat .terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ steps.tfv.outputs.versao }}
+          terraform_wrapper: false
+
+      - name: Credenciais AWS (role read-only)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Format
+        working-directory: terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Plan
+        id: plan
+        working-directory: terraform
+        run: |
+          set +e
+          terraform plan -no-color -lock=false -detailed-exitcode 2>&1 | tee plan.txt
+          codigo=${PIPESTATUS[0]}
+          set -e
+          echo "codigo=$codigo" >> "$GITHUB_OUTPUT"
+          [ "$codigo" -ne 1 ]
+
+      - name: Comentar o plan no PR
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v9
+        env:
+          CODIGO: ${{ steps.plan.outputs.codigo }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marcador = '<!-- terraform-plan -->';
+            const codigo = process.env.CODIGO;
+            const titulo = codigo === '0' ? '✅ Terraform plan — sem mudanças'
+                         : codigo === '2' ? '📋 Terraform plan — há mudanças'
+                         : '❌ Terraform plan — falhou';
+
+            let plan = '(sem saída)';
+            try { plan = fs.readFileSync('terraform/plan.txt', 'utf8'); } catch {}
+            if (plan.length > 60000) plan = '…\n' + plan.slice(-60000);
+
+            const body = `${marcador}\n### ${titulo}\n` +
+              `<sub>commit \`${context.sha.slice(0, 7)}\` · workflow \`${context.workflow}\`</sub>\n\n` +
+              `<details><summary>ver plan</summary>\n\n\`\`\`hcl\n${plan}\n\`\`\`\n</details>`;
+
+            const { data: comentarios } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, per_page: 100,
+            });
+            const existente = comentarios.find(c => c.body && c.body.startsWith(marcador));
+            if (existente) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existente.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+  # ─────────────────────────────────────────────
+  # main (ou disparo manual): build + apply + smoke test
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy (produção)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: testes
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compilar e empacotar as funções
+        run: make build
+
+      - name: Versão do Terraform
+        id: tfv
+        run: echo "versao=$(cat .terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ steps.tfv.outputs.versao }}
+          terraform_wrapper: false
+
+      - name: Credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Format
+        working-directory: terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Plan
+        working-directory: terraform
+        run: terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+
+      - name: Apply
+        working-directory: terraform
+        run: terraform apply -no-color tfplan 2>&1 | tee apply.txt
+
+      # CPF sintaticamente inválido tem que responder 400: prova que a função
+      # subiu, está atrás do Gateway e executou a validação — sem tocar no
+      # banco.
+      - name: Smoke test — POST /auth/token
+        run: |
+          URL=$(aws ssm get-parameter --name "/oficina/prod/apigw/url" \
+            --query Parameter.Value --output text)
+          codigo=$(curl -s -o resposta.json -w '%{http_code}' -X POST "$URL/auth/token" \
+            -H 'Content-Type: application/json' -d '{"cpf":"00000000000"}')
+          echo "HTTP $codigo — $(cat resposta.json)"
+          [ "$codigo" = "400" ] || { echo "esperado 400, veio $codigo"; exit 1; }
+
+      - name: Job Summary
+        if: always()
+        run: |
+          {
+            echo "# λ Deploy — produção"
+            echo
+            echo "Ref \`${{ github.ref_name }}\` · commit \`${GITHUB_SHA::7}\`"
+            echo
+            echo "## Plan"
+            echo '```'
+            tail -n 40 terraform/plan.txt 2>/dev/null || echo "(sem plan)"
+            echo '```'
+            echo
+            echo "## Apply"
+            echo '```'
+            tail -n 20 terraform/apply.txt 2>/dev/null || echo "(não chegou ao apply)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

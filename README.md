@@ -74,7 +74,14 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" \
   -o dist/auth-token/bootstrap ./cmd/auth-token
 ```
 
-Merge na `main` compila as duas funções, aplica o Terraform e roda um smoke test contra `POST /auth/token`.
+`.github/workflows/ci-cd.yml`:
+
+| Evento | Jobs |
+|---|---|
+| PR para `homolog` ou `main` | `gofmt`, `go vet`, build, testes com `-race`, `gitleaks`, e `terraform plan` comentado no PR (role `gha-oficina-lambda-auth-plan`, só leitura) |
+| push na `main` / disparo manual | testes → `make build` → `terraform apply` no *environment* `prod` → smoke test: `POST /auth/token` com CPF inválido tem que responder `400` |
+
+O deploy do código é feito pelo Terraform (`source_code_hash`), não por `aws lambda update-function-code` — misturar os dois gera drift permanente no plan. Por isso o PR também compila: sem os zips o plan nem começa, e como o build é reproduzível (`-trimpath`), código igual dá hash igual e o plan mostra `0 to change`.
 
 ## Contrato com os outros repositórios
 
