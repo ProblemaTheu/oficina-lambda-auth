@@ -1,5 +1,8 @@
 .terraform/
-.terraform.lock.hcl
+# O .terraform.lock.hcl é versionado de propósito: ele fixa a versão exata
+# de cada provider, e sem ele o `terraform init` do CI baixa a mais recente
+# disponível naquele momento. O sintoma é o plan do pipeline divergir do
+# plan local — com o mesmo código.
 *.tfstate
 *.tfstate.*
 *.tfvars

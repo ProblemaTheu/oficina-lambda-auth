@@ -43,8 +43,20 @@ sequenceDiagram
 cmd/auth-token/        handler de emissão do token
 cmd/auth-authorizer/   handler do authorizer do API Gateway
 internal/cpf/          validação de dígitos verificadores (sem dependência externa)
+internal/token/        contrato de claims compartilhado com a aplicação
+internal/segredo/      Secrets Manager com cache por container
 terraform/             funções, IAM, integração e rotas
+Makefile               empacota as funções em dist/*.zip
 ```
+
+## Empacotamento
+
+```bash
+make build   # dist/auth-token.zip e dist/auth-authorizer.zip
+make test    # go test ./... -race -cover
+```
+
+O runtime `provided.al2023` tem duas exigências que **falham em silêncio** quando erradas: o binário dentro do zip precisa se chamar `bootstrap`, e a arquitetura precisa casar com a declarada na função — aqui, `arm64`.
 
 ## Execução local
 
@@ -62,7 +74,14 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" \
   -o dist/auth-token/bootstrap ./cmd/auth-token
 ```
 
-Merge na `main` compila as duas funções, aplica o Terraform e roda um smoke test contra `POST /auth/token`.
+`.github/workflows/ci-cd.yml`:
+
+| Evento | Jobs |
+|---|---|
+| PR para `homolog` ou `main` | `gofmt`, `go vet`, build, testes com `-race`, `gitleaks`, e `terraform plan` comentado no PR (role `gha-oficina-lambda-auth-plan`, só leitura) |
+| push na `main` / disparo manual | testes → `make build` → `terraform apply` no *environment* `prod` → smoke test: `POST /auth/token` com CPF inválido tem que responder `400` |
+
+O deploy do código é feito pelo Terraform (`source_code_hash`), não por `aws lambda update-function-code` — misturar os dois gera drift permanente no plan. Por isso o PR também compila: sem os zips o plan nem começa, e como o build é reproduzível (`-trimpath`), código igual dá hash igual e o plan mostra `0 to change`.
 
 ## Contrato com os outros repositórios
 
