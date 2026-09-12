@@ -85,6 +85,9 @@ jobs:
       - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A versão embutida na action (8.24.x) não interpreta a allowlist
+          # no formato atual do .gitleaks.toml; fixar evita divergir do local.
+          GITLEAKS_VERSION: '8.30.1'
 
   # ─────────────────────────────────────────────
   # Pull Request: compila (o plan depende do hash dos zips) e planeja
