@@ -6,7 +6,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket       = "oficina-tfstate-706215605178"
+    bucket       = "oficina-tfstate-584481982243"
     key          = "lambda-auth/terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
