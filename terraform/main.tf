@@ -16,11 +16,9 @@ locals {
 }
 
 # ── Contrato com os outros repositórios ─────────────────────────────────────
-data "aws_ssm_parameter" "subnets_privadas" { name = "/oficina/shared/vpc/subnets_privadas" }
-data "aws_ssm_parameter" "lambda_sg" { name = "/oficina/shared/lambda/sg_id" }
+# Fase 4 (F4-1.5, ADR-015): sem subnets, SG nem segredo do banco — a Lambda
+# não tem mais rota nem credencial para o RDS do OS.
 data "aws_ssm_parameter" "apigw_id" { name = "/oficina/${var.ambiente}/apigw/id" }
-data "aws_ssm_parameter" "db_host" { name = "/oficina/${var.ambiente}/db/host" }
-data "aws_ssm_parameter" "db_secret_arn" { name = "/oficina/${var.ambiente}/db/secret_arn" }
 data "aws_ssm_parameter" "jwt_secret_arn" { name = "/oficina/${var.ambiente}/jwt/secret_arn" }
 data "aws_ssm_parameter" "apigw_url" { name = "/oficina/${var.ambiente}/apigw/url" }
 
@@ -28,12 +26,12 @@ data "aws_apigatewayv2_api" "principal" {
   api_id = data.aws_ssm_parameter.apigw_id.value
 }
 
-data "aws_secretsmanager_secret_version" "db" {
-  secret_id = data.aws_ssm_parameter.db_secret_arn.value
-}
-
-locals {
-  db = jsondecode(data.aws_secretsmanager_secret_version.db.secret_string)
+# Token de serviço das rotas /internal/* do OS Service. Criado pelo
+# scripts/prod-secret.sh do oficina-app no formato {"token": "..."} — o mesmo
+# valor vai para o INTERNAL_TOKEN do pod do OS. Só o ARN entra aqui: o valor
+# é lido pela função em tempo de execução, não pelo Terraform.
+data "aws_secretsmanager_secret" "interno" {
+  name = "oficina/${var.ambiente}/internal"
 }
 
 # ── IAM ─────────────────────────────────────────────────────────────────────
@@ -55,12 +53,7 @@ resource "aws_iam_role_policy_attachment" "basico" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# Necessário para a função criar ENIs nas subnets privadas.
-resource "aws_iam_role_policy_attachment" "vpc" {
-  role       = aws_iam_role.lambda.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
-
+# Sem AWSLambdaVPCAccessExecutionRole: a função saiu da VPC (ADR-015).
 # Só os dois segredos que as funções realmente leem — nada de "*".
 resource "aws_iam_role_policy" "segredos" {
   name = "ler-segredos"
@@ -73,7 +66,7 @@ resource "aws_iam_role_policy" "segredos" {
       Action = ["secretsmanager:GetSecretValue"]
       Resource = [
         data.aws_ssm_parameter.jwt_secret_arn.value,
-        data.aws_ssm_parameter.db_secret_arn.value,
+        data.aws_secretsmanager_secret.interno.arn,
       ]
     }]
   })
@@ -104,24 +97,10 @@ resource "aws_lambda_function" "fn" {
       JWT_SECRET_NAME = data.aws_ssm_parameter.jwt_secret_arn.value
       JWT_SECRET_KEY  = "jwt_secret"
 
-      DB_DSN = format(
-        "postgres://%s:%s@%s:5432/%s?sslmode=require",
-        local.db["username"], local.db["password"],
-        data.aws_ssm_parameter.db_host.value, local.db["dbname"],
-      )
-    }
-  }
-
-  # Só a auth-token entra na VPC, e só porque precisa alcançar o RDS privado.
-  # A authorizer fica fora de propósito: ela lê apenas o Secrets Manager, e
-  # ficar fora da VPC dispensa a criação de ENI no cold start — ela está no
-  # caminho de TODA requisição protegida, então a latência dela é a latência
-  # de todo mundo.
-  dynamic "vpc_config" {
-    for_each = each.key == "auth-token" ? [1] : []
-    content {
-      subnet_ids         = split(",", data.aws_ssm_parameter.subnets_privadas.value)
-      security_group_ids = [data.aws_ssm_parameter.lambda_sg.value]
+      # auth-token consulta o cliente no OS Service (F4-1.5). Pelo balanceador
+      # público: as duas funções ficam fora da VPC, sem ENI no cold start.
+      OS_INTERNAL_URL            = local.backend["os"]
+      INTERNAL_TOKEN_SECRET_NAME = data.aws_secretsmanager_secret.interno.arn
     }
   }
 }
